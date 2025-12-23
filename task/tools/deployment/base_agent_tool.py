@@ -23,7 +23,6 @@ class BaseAgentTool(BaseTool, ABC):
         pass
 
     async def _execute(self, tool_call_params: ToolCallParams) -> str | Message:
-        #TODO:
         # 1. All the agents that will used as tools will have two parameters in request:
         #   - `prompt` (the request to agent)
         #   - `propagate_history`, boolean whether we need to propagate the history of communication with called agent
@@ -56,10 +55,44 @@ class BaseAgentTool(BaseTool, ABC):
         # 6. Return Tool message
         #    ⚠️ Remember, tool message must have tool call id, also don't forget to add `custom_content` since we need
         #       to save properly tool history to choice state later
-        raise NotImplementedError()
+        
+        dial_client = AsyncDial(api_version='2025-01-01-preview', base_url=self.endpoint, api_key=tool_call_params.api_key)
+        tool_args = json.loads(tool_call_params.tool_call.function.arguments)
+        conversation_id_header = {"x-conversation-id": tool_call_params.conversation_id}
+        tool_args_body = {"custom_fields": {"configuration": {**tool_args}}}
+        messages = self._prepare_messages(tool_call_params)
+
+        response_chunks = await dial_client.chat.completions.create(
+            deployment_name=self.deployment_name,
+            messages=messages, # type: ignore
+            stream=True,
+            extra_headers=conversation_id_header,
+            extra_body=tool_args_body
+        )
+
+        content = ''
+        custom_content: CustomContent = CustomContent(attachments=[])
+        async for chunk in response_chunks:
+            if chunk.choices and len(chunk.choices) > 0:
+                choice = chunk.choices[0]
+                if choice.delta.content:
+                    content += choice.delta.content
+
+                if choice.delta.custom_content:
+                    if state := choice.delta.custom_content.state:
+                        custom_content.state = state
+
+                    if attachments := choice.delta.custom_content.attachments:
+                        custom_content.attachments += attachments
+
+        return Message(
+            role=Role.TOOL,
+            content=content,
+            tool_call_id=tool_call_params.tool_call.id,
+            custom_content=custom_content
+        )
 
     def _prepare_messages(self, tool_call_params: ToolCallParams) -> list[dict[str, Any]]:
-        #TODO:
         # In here we will manage the context for the agent that we are going to call.
         # We support two modes:
         #   - One-shot: only one user message to the Agent with prompt
@@ -76,4 +109,25 @@ class BaseAgentTool(BaseTool, ABC):
         #   message. For assistant message you need to make a deepcopy and refactor the state for copied message, instead
         #   of the whole state you need to get from the state value by `self.name`
         # 4. Lastly, add the user message with `prompt` and don't forget about the custom_content
-        raise NotImplementedError()
+        tool_args = json.loads(tool_call_params.tool_call.function.arguments)
+        should_propagate = tool_args.get("propagate_history", False)
+
+        messages = []
+        if should_propagate:
+            for msg in tool_call_params.messages:
+                if msg.role == Role.ASSISTANT and msg.custom_content and msg.custom_content.state:
+                    state_dict: dict[str, Any] = msg.custom_content.state.model_dump()
+                    if state_dict.get(self.name):
+                        previous_msg = tool_call_params.messages[tool_call_params.messages.index(msg) - 1]
+                        messages.append(previous_msg.model_dump(exclude_none=True))
+
+                        msg_copy = deepcopy(msg)
+                        msg_copy.custom_content.state = state_dict.get(self.name) # type: ignore
+                        messages.append(msg_copy.model_dump(exclude_none=True))
+
+        last_user_msg = { "role": Role.USER.value, "content": tool_args["prompt"] }
+        if custom_content := tool_call_params.messages[-1].custom_content:
+            last_user_msg["custom_content"] = custom_content.model_dump(exclude_none=True)
+
+        messages.append(last_user_msg)
+        return messages
